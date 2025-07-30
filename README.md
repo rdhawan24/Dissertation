@@ -111,10 +111,12 @@ I have created 2 virtual environments.
    Requirements file:
    1. **.venv** 
       pip freeze --all > requirements_venv.txt
+
       pip list --not-required --format=freeze > requirements_venv.in
       
-   2. **llm_env** 
+   3. **llm_env** 
       pip freeze --all > requirements_llm_env.txt
+
       pip list --not-required --format=freeze > requirements_llm_env.in
   
       # Steps to recreate the env
