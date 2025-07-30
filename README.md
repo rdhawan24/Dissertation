@@ -13,7 +13,91 @@ This project explores how Format-Preserving Encryption (FPE) can be used to prot
 To investigate this, the project uses the publicly available Enron email dataset, which mimics a real-world corporate communication environment containing various types of sensitive information. The study applies FPE-based anonymization to emails and evaluates the impact on LLM performance across multiple tasks, comparing it with traditional tokenization and full redaction methods. 
 The goal is to assess whether FPE strikes a balance between privacy protection and functional accuracy, enabling organizations to use LLMs safely without significant degradation in model outputs or context understanding. By doing so, the project contributes to the broader field of privacy-preserving natural language processing (PP-NLP) and provides practical insights for securely integrating LLMs into real-world workflows. 
 
+**Main Steps in the Project** 
+
+1. Data Acquisition & Preprocessing 
+
+Load and clean the Enron email dataset. 
+
+Extract relevant metadata (e.g., sender, recipients, subject, message body). 
+
+Filter and group emails into conversation threads based on subject and participants. 
+
+Select a meaningful subset (e.g., longer threads with project or status-related keywords) for experimentation. 
+
+ 
+
+2. Entity Detection & Anonymization 
+
+Use Named Entity Recognition (NER) models and regex to identify Personally Identifiable Information (PII) such as: 
+
+Names 
+
+Email addresses 
+
+Card numbers 
 
 
+Apply three anonymization strategies: 
 
-Enron dataset can be downloaded from: https://www.kaggle.com/datasets/wcukierski/enron-email-dataset
+Raw (no anonymization) 
+
+Tokenization (e.g., <NAME_001>) 
+
+Format-Preserving Encryption (FPE) 
+
+ 
+
+3. LLM-Based Task Execution 
+
+For each anonymization version of the emails, send prompts to an LLM (local) for various tasks: 
+
+
+Classification (in which category the mail falls into e.g., request, update, complaint) 
+
+Named Entity Recognition : Does this mail have a credit card number. If yes then who is the issuer
+
+Relationship Extraction (e.g., "Who reports to whom?") 
+
+Sentiment analysis- Positive, Negative, Neutral tone of email
+
+ 
+
+4. Evaluation of Output Quality 
+
+Evaluate the LLM outputs across the three versions using: 
+
+Automatic metrics: ROUGE, BLEU, accuracy, precision/recall 
+
+Human judgment (if feasible): fluency, coherence, utility 
+
+Analyze how well FPE preserves task performance compared to raw and tokenized inputs. 
+
+ 
+
+5. Privacy Impact Discussion [optional]
+
+Qualitatively compare the privacy guarantees of FPE vs. tokenization. 
+
+Discuss risks of memorization, type leakage, and referential integrity. 
+
+ 
+
+6. Conclusions & Recommendations 
+
+Summarize findings on the tradeoff between privacy and utility. 
+
+Recommend best practices for organizations considering LLMs on sensitive text. 
+
+Suggest future directions, e.g., hybrid models, use of different LLMs, or larger corpora. 
+
+ 
+
+
+Hypothesis: Using former preserving encryption or tokenization will be closer to the performance of no anonymisation than replacing with hexadecimal 
+
+Assumption: llm's are not just looking at these as arbitrary tokens, but they know whether something is a name or e-mail address. 
+
+
+Enron dataset can be downloaded from: https://www.kaggle.com/datasets/wcukierski/enron-email-dataset.
+This is a 1.43 GB email database with 2 columns-file,messages
