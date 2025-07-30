@@ -101,3 +101,26 @@ Assumption: llm's are not just looking at these as arbitrary tokens, but they kn
 
 Enron dataset can be downloaded from: https://www.kaggle.com/datasets/wcukierski/enron-email-dataset.
 This is a 1.43 GB email database with 2 columns-file,messages
+
+**Setting up Virtual environments**
+I have created 2 virtual environments.
+1) Preprocessing tasks and Anonymisation .venv
+2) LLM related tasks llm_env
+
+   **Python Version**: Python 3.9.21
+   Requirements file:
+   1. **.venv** 
+      pip freeze --all > requirements_venv.txt
+      pip list --not-required --format=freeze > requirements_venv.in
+      
+   2. **llm_env** 
+      pip freeze --all > requirements_llm_env.txt
+      pip list --not-required --format=freeze > requirements_llm_env.in
+  
+      # Steps to recreate the env
+      #Use the same python version
+      python3 -m venv .venv 
+
+      source .venv/bin/activate 
+
+      pip install -r requirements_venv.txt 
