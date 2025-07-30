@@ -95,6 +95,9 @@ def main() -> None:
     print(f"Grouped into {threads.height:,} conversation threads:\n")
     print(threads.head(10))
 
+    # Save 20 rows from the final dataframe for testing
+    df.sample(20).write_csv("../dataset/sample_20rows.csv")
+    print("→ Sample of 20 rows saved to dataset/sample_20rows.csv")
 
 if __name__ == "__main__":
     main()
