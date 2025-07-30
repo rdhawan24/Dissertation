@@ -90,6 +90,17 @@ def main() -> None:
 
     threads = build_threads(df)
 
+   
+    # after: df = gather_slices(...)
+    print(
+        df.select([
+            (pl.col("first_name") != "").sum().alias("first_name_hits"),
+            (pl.col("last_name")  != "").sum().alias("last_name_hits"),
+            (pl.col("money")      != "").sum().alias("money_hits"),
+            (pl.col("card_number")!= "").sum().alias("card_hits"),
+        ])
+    )
+
     # ── sample output ──
     print(f"\nLoaded {df.height:,} rows × {df.width} cols")
     print(f"Grouped into {threads.height:,} conversation threads:\n")
