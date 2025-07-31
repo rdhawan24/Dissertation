@@ -1,100 +1,114 @@
 #!/usr/bin/env python3
 """
-main.py – multi‑process loader & thread builder for the Enron e‑mail CSV.
-
-  • counts data rows safely (even with embedded newlines)
-  • splits work across N CPU processes
-  • concatenates enriched slices
-  • groups into conversation threads (subject + participants)
-
-Run:
-    python main.py ./dataset/emails.csv              # use all CPU cores
-    python main.py ./dataset/emails.csv -j 12        # force 12 processes
+main.py – orchestrate multi-process PII extraction with smooth, row-level progress
 """
+
 from __future__ import annotations
+
 import argparse
 import csv
-import math
 import os
+import queue
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+from typing import List, Tuple
+
+import multiprocessing as mp
 import polars as pl
 from tqdm import tqdm
 
 from chunk_worker import process_rows
+from email_processing import preload_pipe
 
+# ── config ────────────────────────────────────────────────────────────────────
+SLICE_ROWS = 5_000          # keep large slices for efficient I/O
 
-# ─── helpers ─────────────────────────────────────────────────────────────────
-def count_data_rows(path: Path) -> int:
-    """True record count, honouring quoted newlines (header excluded)."""
+# ── helpers ───────────────────────────────────────────────────────────────────
+def count_rows(p: Path) -> int:
+    """Return number of *data* rows (header excluded)."""
+    if not p.exists():
+        raise FileNotFoundError(p)
+
     csv.field_size_limit(sys.maxsize)
-    with path.open("r", newline="", encoding="utf-8", errors="ignore") as f:
+    with p.open("r", encoding="utf-8", errors="ignore", newline="") as f:
         rdr = csv.reader(f)
-        next(rdr, None)  # discard header
+        header = next(rdr, None)
+        if header is None:
+            raise ValueError(f"{p} appears empty")
         return sum(1 for _ in rdr)
 
 
-def plan_work(total: int, n_procs: int) -> list[tuple[int, int]]:
-    """Return list of (start_row, n_rows) slices."""
-    per = math.ceil(total / n_procs)
-    return [
-        (i * per, min(per, total - i * per))
-        for i in range(n_procs)
-        if (i * per) < total
-    ]
+def plan_slices(total: int) -> List[Tuple[int, int]]:
+    """Return (start, n_rows) pairs that cover *total* rows."""
+    return [(i, min(SLICE_ROWS, total - i)) for i in range(0, total, SLICE_ROWS)]
 
 
-def gather_slices(path: Path, ranges: list[tuple[int, int]], workers: int) -> pl.DataFrame:
-    """Spawn workers -> gather processed frames -> concat."""
-    dfs: list[pl.DataFrame] = []
-    with ProcessPoolExecutor(max_workers=workers) as pool:
-        futs = [pool.submit(process_rows, path, s, n) for s, n in ranges]
-        for fut in tqdm(as_completed(futs), total=len(futs), desc="workers"):
-            dfs.append(fut.result())
+def gather(path: Path, slices: List[Tuple[int, int]], workers: int) -> pl.DataFrame:
+    """
+    Run workers in parallel *and* stream row-level progress back through a
+    multiprocessing.Manager queue (which is pickle-safe under 'spawn').
+    """
+    dfs: List[pl.DataFrame] = []
+
+    with mp.Manager() as manager:
+        prog_q = manager.Queue()                      # proxy object → pickle-able
+
+        ctx = mp.get_context()                        # uses the 'spawn' start method
+        with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
+            futs = [
+                pool.submit(process_rows, path, s, n, prog_q)
+                for s, n in slices
+            ]
+
+            total_rows = sum(n for _, n in slices)
+            remaining = len(futs)
+
+            with tqdm(total=total_rows, desc="rows", unit="row",
+                      mininterval=0.5, smoothing=0.2) as bar:
+                while remaining:
+                    # drain queued progress
+                    try:
+                        while True:
+                            bar.update(prog_q.get_nowait())
+                    except queue.Empty:
+                        pass
+
+                    # collect finished futures
+                    done_now = [f for f in futs if f.done()]
+                    for f in done_now:
+                        dfs.append(f.result())
+                        futs.remove(f)
+                        remaining -= 1
+
+                    time.sleep(0.2)
+
+                # flush any last progress items
+                try:
+                    while True:
+                        bar.update(prog_q.get_nowait())
+                except queue.Empty:
+                    pass
+
     return pl.concat(dfs, how="vertical", rechunk=True)
 
 
-def build_threads(df: pl.DataFrame) -> pl.DataFrame:
-    """Group e‑mails into conversation threads."""
-    return (
-        df.with_columns(
-            (pl.col("subj_norm") + "||" + pl.col("participants_sig")).alias("thread_key")
-        )
-        .group_by("thread_key")
-        .agg(
-            [
-                pl.len().alias("email_count"),
-                pl.min("date").alias("first_seen"),
-                pl.max("date").alias("last_seen"),
-                pl.concat_list("file").alias("files"),
-            ]
-        )
-        .sort("email_count", descending=True)
-    )
+# ── entry point ───────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)          # fork-safe with PyTorch
+    preload_pipe()                                    # optional warm-up
 
-
-# ─── CLI & orchestration ─────────────────────────────────────────────────────
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Enron multi‑process CSV loader")
-    ap.add_argument("csv", type=Path, help="Path to emails.csv")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("csv", type=Path, help="CSV file with the Enron e-mails")
     ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count(),
-                    help="Worker processes (default: CPU cores)")
+                    help="Number of worker processes (default: logical cores)")
     args = ap.parse_args()
 
-    total_rows = count_data_rows(args.csv)
-    slices = plan_work(total_rows, args.jobs)
+    total = count_rows(args.csv)
+    slices = plan_slices(total)
 
-    print(f"→ {total_rows:,} e‑mails, {len(slices)} slices, {args.jobs} workers")
-    df = gather_slices(args.csv, slices, args.jobs)
-
-    threads = build_threads(df)
-
-    # ── sample output ──
-    print(f"\nLoaded {df.height:,} rows × {df.width} cols")
-    print(f"Grouped into {threads.height:,} conversation threads:\n")
-    print(threads.head(10))
-
-
-if __name__ == "__main__":
-    main()
+    print(f"→ {total:,} rows, {len(slices)} slices, {args.jobs} workers")
+    t0 = time.perf_counter()
+    df = gather(args.csv, slices, args.jobs)
+    print(f"Done {df.height:,} rows in {time.perf_counter()-t0:.1f}s")
