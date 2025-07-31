@@ -1,90 +1,114 @@
 """
-email_processing.py – extract metadata from raw RFC‑822 messages.
-Now uses policy.compat32 so broken headers don’t abort parsing.
+email_processing.py
+───────────────────
+Fast PII extraction with a *local* copy of ab-ai/pii_model.
+Five pipe-separated columns are returned for each e-mail:
+
+    first_names | last_names | currencies | credit_cards | cc_issuers
 """
+
 from __future__ import annotations
-import re
-import email
-from email import policy
-from email.utils import getaddresses
-from typing import Dict, Any, Tuple
+from functools import lru_cache
+from pathlib import Path
+from typing import List, Dict
 
-# ─── helpers ─────────────────────────────────────────────────────────────────
-_SUBJ_RE = re.compile(r"^(?:(?:re|fw|fwd)\s*[:\]]\s*)+", re.I)
-_ADDR_RE = re.compile(r"[^@,\s]+@[^@,\s]+")
+import warnings
+import torch
+from transformers import (
+    AutoTokenizer,
+    AutoModelForTokenClassification,
+    pipeline,
+)
+
+# ── silence noisy warnings ──────────────────────────────────────────────────
+warnings.filterwarnings("ignore", category=UserWarning, module=r"transformers")
+warnings.filterwarnings("ignore", category=FutureWarning, module=r"torch")
+
+# ── model location & config ─────────────────────────────────────────────────
+MODEL_DIR     = Path.home() / "hf_models" / "pii_model"  # adjust if needed
+BATCH_SIZE    = 32        # needs ~1.8 GB RAM/worker; lower to 16 on 8 GB boxes
+TORCH_THREADS = 1         # intra-op threads per worker (keeps CPU fair)
+
+LABEL_MAP = {
+    "FIRSTNAME": "first_names",
+    "LASTNAME":  "last_names",
+    "AMOUNT":    "currencies",
+    "CREDITCARDNUMBER": "credit_cards",
+    "CREDITCARDISSUER": "cc_issuers",
+}
+_EMPTY = {v: "" for v in LABEL_MAP.values()}
+
+_PIPE = None  # lazy singleton per process
 
 
-def normalise_subject(subj: str | None) -> str:
-    if subj is None:
-        return ""
-    subj = _SUBJ_RE.sub("", subj).strip()
-    return re.sub(r"\s+", " ", subj)
+def _get_pipe():
+    """Load weights/tokenizer once per worker."""
+    global _PIPE
+    if _PIPE is None:
+        torch.set_num_threads(TORCH_THREADS)
+        torch.set_num_interop_threads(1)
 
-
-def addr_set(field_val: str | None) -> Tuple[str, ...]:
-    if not field_val:
-        return tuple()
-    return tuple(
-        sorted(
-            {
-                a.lower()
-                for _, a in getaddresses([field_val])
-                if _ADDR_RE.fullmatch(a)
-            }
+        tok = AutoTokenizer.from_pretrained(MODEL_DIR, local_files_only=True)
+        mdl = AutoModelForTokenClassification.from_pretrained(
+            MODEL_DIR, local_files_only=True
         )
-    )
+        _PIPE = pipeline(
+            "ner",
+            model=mdl,
+            tokenizer=tok,
+            device=-1,                 # CPU
+            batch_size=BATCH_SIZE,
+            aggregation_strategy="simple",   # future-proof
+        )
+    return _PIPE
 
 
-# ─── main extractor ─────────────────────────────────────────────────────────
-def parse_email_raw(raw: str) -> Dict[str, Any]:
+@lru_cache(maxsize=4096)
+def _extract_body(raw: str, limit: int = 2000) -> str:
     """
-    Robustly parse *raw* message → dict with sender, recipients, etc.
-    Any exception returns blank fields rather than raising.
+    Ultra-fast plain-text body extraction:
+    take text after the first blank line (RFC-822 separator).
     """
-    try:
-        # compat32 ⇒ headers come back as plain text; no structured parsing
-        msg = email.message_from_string(raw, policy=policy.compat32)
+    parts = raw.split("\n\n", 1)
+    return (parts[1] if len(parts) > 1 else raw)[:limit]
 
-        sender = addr_set(msg.get("From"))
-        to_addrs = addr_set(msg.get("To"))
-        cc_addrs = addr_set(msg.get("Cc"))
 
-        # Plain‑text body (first text/plain part, else whole payload)
-        body = ""
-        if msg.is_multipart():
-            for part in msg.walk():
-                if part.get_content_type() == "text/plain":
-                    body = part.get_payload(decode=True).decode(
-                        part.get_content_charset() or "utf-8", "replace"
-                    ).strip()
-                    break
-        else:
-            body = msg.get_payload(decode=True).decode(
-                msg.get_content_charset() or "utf-8", "replace"
-            ).strip()
+# ── public batched helper ───────────────────────────────────────────────────
+def ner_batch(bodies: List[str]) -> List[Dict[str, str]]:
+    """
+    Run PII NER on a batch of plain-text snippets.
 
-        subj_raw = (msg.get("Subject") or "").strip()
+    Parameters
+    ----------
+    bodies : list[str]  (len > 0)
 
-        return {
-            "sender": sender[0] if sender else "",
-            "to": ", ".join(to_addrs),
-            "cc": ", ".join(cc_addrs),
-            "subject": subj_raw,
-            "subj_norm": normalise_subject(subj_raw),
-            "participants_sig": "|".join(sorted({*sender, *to_addrs, *cc_addrs})),
-            "date": msg.get("Date"),
-            "body": body,
-        }
+    Returns
+    -------
+    list[dict]  same length, each dict has the 5 pipe-sep columns
+    """
+    pipe = _get_pipe()
+    raw = pipe(bodies)
 
-    except Exception:
-        # Fallback for completely broken messages
-        return {
-            "sender": "",
-            "to": "",
-            "cc": "",
-            "subject": "",
-            "subj_norm": "",
-            "participants_sig": "",
-            "date": "",
-            "body": "",
-        }
+    # transformers returns dict instead of list when len==1
+    if isinstance(raw, dict):
+        raw = [raw]
+
+    parsed: List[Dict[str, str]] = []
+    for ents in raw:
+        buckets = {k: set() for k in LABEL_MAP.values()}
+        for e in ents:
+            lab = e.get("entity_group") or e.get("entity")
+            if lab in LABEL_MAP:
+                buckets[LABEL_MAP[lab]].add(e["word"].strip())
+        parsed.append({k: "|".join(sorted(v)) for k, v in buckets.items()})
+
+    while len(parsed) < len(bodies):      # rare pipeline failure padding
+        parsed.append(_EMPTY.copy())
+
+    return parsed
+
+
+# ── optional: preload in parent so forked workers share RAM ────────────────
+def preload_pipe() -> None:
+    _get_pipe()     # just trigger lazy loader
+

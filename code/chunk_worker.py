@@ -1,53 +1,64 @@
 """
-chunk_worker.py – worker for ProcessPoolExecutor.
-Loads one ROW slice from the Enron CSV, then extracts e-mail metadata + PII.
-Polars-version-agnostic: no Series.apply / Expr.apply required.
+chunk_worker.py – worker process code.
+
+Each worker:
+1. Reads *n_rows* rows starting at *start_row* from the CSV.
+2. Extracts plain-text e-mail bodies (fast).
+3. Runs batched PII NER, emitting progress to *progress_q* every batch.
+4. Returns a Polars DataFrame with the original path plus 5 PII columns.
 """
+
 from __future__ import annotations
+
 from pathlib import Path
+from typing import List, Optional
+
 import polars as pl
-from email_processing import parse_email_raw
 
-def _safe_extract_entities(text_for_ner: str, sender_email: str) -> dict:
-    """Import lazily; always return stable keys."""
-    try:
-        from pii_utils import extract_entities
-        return extract_entities(text_for_ner, sender_email)
-    except Exception:
-        return {"first_name": "", "last_name": "", "money": "", "card_number": ""}
+from email_processing import ner_batch, _extract_body, BATCH_SIZE
 
-def process_rows(path: str | Path, start_row: int, n_rows: int) -> pl.DataFrame:
-    """
-    Parameters
-    ----------
-    start_row : data-row offset (0-based, header excluded)
-    n_rows    : number of rows assigned to this slice
-    """
+BODY_LIMIT = 2_000   # trim huge messages
+
+
+def _stream_batches(bodies: List[str], progress_q, step: int) -> List[dict]:
+    """NER in *step*-sized chunks; stream progress after each chunk."""
+    out: List[dict] = []
+    for i in range(0, len(bodies), step):
+        batch = bodies[i : i + step]
+        out.extend(ner_batch(batch))
+        if progress_q is not None:
+            progress_q.put(len(batch))      # rows processed
+    return out
+
+
+def process_rows(
+    path: str | Path,
+    start_row: int,
+    n_rows: int,
+    progress_q: Optional[object] = None,    # manager.Queue proxy
+) -> pl.DataFrame:
+    """Worker entry point – must be pickle-able under the 'spawn' context."""
     if n_rows <= 0:
         return pl.DataFrame()
 
-    # 1) Load slice
+    # 1. Load slice
     df = pl.read_csv(
         path,
         has_header=True,
-        skip_rows=start_row,        # header already parsed
+        skip_rows=start_row,
         n_rows=n_rows,
         new_columns=["file", "message"],
         infer_schema_length=0,
         low_memory=True,
     )
 
-    # 2) Parse + PII extraction (use subject + body to improve recall)
-    messages = df["message"].to_list()
-    meta_dicts = []
-    for raw in messages:
-        meta = parse_email_raw(raw)
-        text_for_ner = f"{meta.get('subject','')}\n{meta.get('body','')}"
-        ner = _safe_extract_entities(text_for_ner, meta.get("sender", ""))
-        meta.update(ner)
-        meta_dicts.append(meta)
+    # 2. Extract bodies
+    bodies: List[str] = [_extract_body(m, BODY_LIMIT) for m in df["message"]]
 
-    # 3) Build DF & combine with "file"
+    # 3. Batched NER with incremental progress
+    meta_dicts = _stream_batches(bodies, progress_q, step=BATCH_SIZE)
+
+    # 4. Merge & return
     meta_df = pl.from_dicts(meta_dicts)
-    return pl.concat([df.drop("message"), meta_df], how="horizontal")
+    return pl.concat([df.select("file"), meta_df], how="horizontal")
 
