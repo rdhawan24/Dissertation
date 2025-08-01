@@ -1,114 +1,200 @@
-#!/usr/bin/env python3
+# main.py
 """
-main.py – orchestrate multi-process PII extraction with smooth, row-level progress
+main.py
+────────
+Drive parallel PII extraction over an email CSV using ProcessPoolExecutor.
+Supports GPU auto-detect, smoke-test mode, dynamic slicing, and clean Ctrl+C shutdown.
 """
 
 from __future__ import annotations
-
-import argparse
-import csv
 import os
-import queue
 import sys
+import csv
 import time
-from concurrent.futures import ProcessPoolExecutor
-from pathlib import Path
-from typing import List, Tuple
+import argparse
+import signal
+from concurrent.futures import ProcessPoolExecutor, wait
+from multiprocessing import Manager, get_context
 
-import multiprocessing as mp
 import polars as pl
 from tqdm import tqdm
 
-from chunk_worker import process_rows
 from email_processing import preload_pipe
+from chunk_worker import process_rows
 
-# ── config ────────────────────────────────────────────────────────────────────
-SLICE_ROWS = 5_000          # keep large slices for efficient I/O
-
-# ── helpers ───────────────────────────────────────────────────────────────────
-def count_rows(p: Path) -> int:
-    """Return number of *data* rows (header excluded)."""
-    if not p.exists():
-        raise FileNotFoundError(p)
-
-    csv.field_size_limit(sys.maxsize)
-    with p.open("r", encoding="utf-8", errors="ignore", newline="") as f:
-        rdr = csv.reader(f)
-        header = next(rdr, None)
-        if header is None:
-            raise ValueError(f"{p} appears empty")
-        return sum(1 for _ in rdr)
+# Flag for interruption
+_interrupted = False
 
 
-def plan_slices(total: int) -> List[Tuple[int, int]]:
-    """Return (start, n_rows) pairs that cover *total* rows."""
-    return [(i, min(SLICE_ROWS, total - i)) for i in range(0, total, SLICE_ROWS)]
+def _install_sigint_handler():
+    def handler(signum, frame):
+        global _interrupted          # <-- use global, not nonlocal
+        _interrupted = True
+        print(
+            "\n[main] SIGINT received; attempting graceful shutdown...",
+            file=sys.stderr,
+        )
 
+    import signal
 
-def gather(path: Path, slices: List[Tuple[int, int]], workers: int) -> pl.DataFrame:
+    signal.signal(signal.SIGINT, handler)
+
+def count_rows(path: str) -> int:
     """
-    Run workers in parallel *and* stream row-level progress back through a
-    multiprocessing.Manager queue (which is pickle-safe under 'spawn').
+    Count data rows (excluding header) in a CSV.
+    Raises csv.field_size_limit to avoid 'field larger than field limit' errors.
+    Falls back to naive line counting if the csv module still fails.
     """
-    dfs: List[pl.DataFrame] = []
-
-    with mp.Manager() as manager:
-        prog_q = manager.Queue()                      # proxy object → pickle-able
-
-        ctx = mp.get_context()                        # uses the 'spawn' start method
-        with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
-            futs = [
-                pool.submit(process_rows, path, s, n, prog_q)
-                for s, n in slices
-            ]
-
-            total_rows = sum(n for _, n in slices)
-            remaining = len(futs)
-
-            with tqdm(total=total_rows, desc="rows", unit="row",
-                      mininterval=0.5, smoothing=0.2) as bar:
-                while remaining:
-                    # drain queued progress
-                    try:
-                        while True:
-                            bar.update(prog_q.get_nowait())
-                    except queue.Empty:
-                        pass
-
-                    # collect finished futures
-                    done_now = [f for f in futs if f.done()]
-                    for f in done_now:
-                        dfs.append(f.result())
-                        futs.remove(f)
-                        remaining -= 1
-
-                    time.sleep(0.2)
-
-                # flush any last progress items
-                try:
-                    while True:
-                        bar.update(prog_q.get_nowait())
-                except queue.Empty:
-                    pass
-
-    return pl.concat(dfs, how="vertical", rechunk=True)
+    try:
+        max_int = sys.maxsize
+        while True:
+            try:
+                csv.field_size_limit(max_int)
+                break
+            except OverflowError:
+                max_int = int(max_int / 10)
+        with open(path, newline="") as f:
+            reader = csv.reader(f)
+            next(reader, None)  # skip header
+            return sum(1 for _ in reader)
+    except csv.Error as e:
+        print(
+            f"Warning: csv.Error during row count ({e}); falling back to line count. "
+            "Embedded newlines may cause inaccuracy.",
+            file=sys.stderr,
+        )
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            total_lines = sum(1 for _ in f)
+        return max(total_lines - 1, 0)
 
 
-# ── entry point ───────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    mp.set_start_method("spawn", force=True)          # fork-safe with PyTorch
-    preload_pipe()                                    # optional warm-up
+def pick_slice_rows(total_rows: int, workers: int) -> int:
+    """
+    Pick slice size so that each worker gets ~3+ slices.
+    Rounded up to nearest 1 000 for I/O efficiency.
+    """
+    target = max(total_rows // (workers * 3), 1)
+    return int((target + 999) // 1000) * 1000
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument("csv", type=Path, help="CSV file with the Enron e-mails")
-    ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count(),
-                    help="Number of worker processes (default: logical cores)")
+
+def plan_slices(total: int, slice_rows: int) -> list[tuple[int, int]]:
+    """Return [(start, count), …] that cover [0,total)."""
+    return [(i, min(slice_rows, total - i)) for i in range(0, total, slice_rows)]
+
+
+def main():
+    global _interrupted
+    ap = argparse.ArgumentParser(description="Parallel PII extraction over emails CSV")
+    ap.add_argument("csv", help="Path to input CSV file")
+    ap.add_argument(
+        "-j", "--jobs",
+        type=int,
+        default=os.cpu_count(),
+        help="Number of worker processes (default: logical cores)",
+    )
+    ap.add_argument(
+        "-n", "--num-rows",
+        type=int,
+        help="Process only the first N rows (for quick tests)",
+    )
+    ap.add_argument(
+        "--device",
+        choices=["cpu", "cuda"],
+        default=None,
+        help="Override device choice (auto = GPU if available)",
+    )
     args = ap.parse_args()
 
-    total = count_rows(args.csv)
-    slices = plan_slices(total)
+    # install interrupt handler
+    _install_sigint_handler()
 
-    print(f"→ {total:,} rows, {len(slices)} slices, {args.jobs} workers")
-    t0 = time.perf_counter()
-    df = gather(args.csv, slices, args.jobs)
-    print(f"Done {df.height:,} rows in {time.perf_counter()-t0:.1f}s")
+    # Force CPU if requested
+    if args.device == "cpu":
+        os.environ["PII_FORCE_CPU"] = "1"
+    elif args.device == "cuda":
+        os.environ["PII_FORCE_CPU"] = "0"
+
+    # Warm up the model in parent (helps with fork sharing)
+    preload_pipe()
+
+    total_all = count_rows(args.csv)
+    total = min(total_all, args.num_rows) if args.num_rows else total_all
+
+    slice_size = pick_slice_rows(total, args.jobs)
+    slices = plan_slices(total, slice_size)
+
+    manager = Manager()
+    prog_q = manager.Queue()
+
+    workers = args.jobs
+    ctx = get_context("spawn")  # safe for PyTorch
+    dfs: list[pl.DataFrame] = []
+
+    start_ts = time.time()
+    pool = ProcessPoolExecutor(max_workers=workers, mp_context=ctx)
+    try:
+        futures = [
+            pool.submit(process_rows, args.csv, start, count, prog_q)
+            for start, count in slices
+        ]
+        pbar = tqdm(total=total, desc="Processing rows", unit="rows")
+        try:
+            completed = 0
+            while completed < len(slices):
+                if _interrupted:
+                    raise KeyboardInterrupt
+                try:
+                    n = prog_q.get(timeout=0.5)
+                    pbar.update(n)
+                except Exception:
+                    # timeout or empty; just loop to check interrupt
+                    pass
+                completed = sum(1 for f in futures if f.done())
+        except KeyboardInterrupt:
+            print("[main] Interrupt detected; cancelling remaining tasks...", file=sys.stderr)
+            # cancel pending futures
+            for f in futures:
+                if not f.done():
+                    f.cancel()
+            # attempt to terminate worker processes aggressively
+            for p in getattr(pool, "_processes", {}).values():
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+            # shutdown executor without waiting
+            pool.shutdown(wait=False, cancel_futures=True)
+        finally:
+            pbar.close()
+
+        # collect results from completed futures
+        for f in futures:
+            if f.cancelled():
+                continue
+            if f.done():
+                try:
+                    dfs.append(f.result())
+                except Exception as e:
+                    print(f"Warning: slice failed with {e}", file=sys.stderr)
+    finally:
+        # ensure executor is shut down if not already
+        try:
+            pool.shutdown(wait=False)
+        except Exception:
+            pass
+
+    if dfs:
+        result_df = pl.concat(dfs, how="vertical")
+        print(result_df)
+    else:
+        if _interrupted:
+            print("Processing was interrupted by user; partial results may exist.", file=sys.stderr)
+        else:
+            print("No data processed; all slices failed.", file=sys.stderr)
+
+    elapsed = time.time() - start_ts
+    print(f"Done in {elapsed:.2f}s", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

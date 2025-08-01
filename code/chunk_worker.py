@@ -1,63 +1,60 @@
+# chunk_worker.py
 """
-chunk_worker.py – worker process code.
-
-Each worker:
-1. Reads *n_rows* rows starting at *start_row* from the CSV.
-2. Extracts plain-text e-mail bodies (fast).
-3. Runs batched PII NER, emitting progress to *progress_q* every batch.
-4. Returns a Polars DataFrame with the original path plus 5 PII columns.
+chunk_worker.py
+────────────────
+Process a slice of rows: read CSV, extract bodies, run NER, return a Polars DataFrame.
 """
 
 from __future__ import annotations
-
+import traceback
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Dict
 
 import polars as pl
 
 from email_processing import ner_batch, _extract_body, BATCH_SIZE
 
-BODY_LIMIT = 2_000   # trim huge messages
 
-
-def _stream_batches(bodies: List[str], progress_q, step: int) -> List[dict]:
-    """NER in *step*-sized chunks; stream progress after each chunk."""
-    out: List[dict] = []
+def _stream_batches(bodies: List[str], progress_q, step: int) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
     for i in range(0, len(bodies), step):
         batch = bodies[i : i + step]
         out.extend(ner_batch(batch))
         if progress_q is not None:
-            progress_q.put(len(batch))      # rows processed
+            progress_q.put(len(batch))
     return out
 
 
 def process_rows(
     path: str | Path,
-    start_row: int,
-    n_rows: int,
-    progress_q: Optional[object] = None,    # manager.Queue proxy
+    start: int,
+    n: int,
+    progress_q,
 ) -> pl.DataFrame:
-    """Worker entry point – must be pickle-able under the 'spawn' context."""
-    if n_rows <= 0:
-        return pl.DataFrame()
-
-    # 1. Load slice
+    """
+    Read 'n' rows from CSV at 'path', starting at 'start'.  
+    Returns a DataFrame with columns:
+      file, first_names, last_names, currencies, credit_cards, cc_issuers
+    """
+    path = Path(path)
+    # skip_rows includes header + 'start' data rows; disable header parsing
     df = pl.read_csv(
         path,
-        has_header=True,
-        skip_rows=start_row,
-        n_rows=n_rows,
-        new_columns=["file", "message"],
-        infer_schema_length=0,
-        low_memory=True,
+        has_header=False,
+        skip_rows=start + 1,
+        n_rows=n,
     )
+    df.columns = ["file", "message"]
 
-    # 2. Extract bodies
-    bodies: List[str] = [_extract_body(m, BODY_LIMIT) for m in df["message"]]
+    # extract full bodies (no trimming)
+    bodies = [_extract_body(m) for m in df["message"]]
 
-    # 3. Batched NER with incremental progress
-    meta_dicts = _stream_batches(bodies, progress_q, step=BATCH_SIZE)
+    try:
+        meta_dicts = _stream_batches(bodies, progress_q, step=BATCH_SIZE)
+    except Exception:
+        traceback.print_exc()
+        return pl.DataFrame()  # fail-safe: return empty
 
-    # 4. Merge & return
-    meta_df = pl.from_dicts(meta_dicts)
+    meta_df = pl.DataFrame(meta_dicts)
+    # horizontally concatenate 'file' with the new PII columns
     return pl.concat([df.select("file"), meta_df], how="horizontal")
