@@ -19,9 +19,6 @@ from multiprocessing import Manager, get_context
 import polars as pl
 from tqdm import tqdm
 
-from email_processing import preload_pipe
-from chunk_worker import process_rows
-
 # Flag for interruption
 _interrupted = False
 
@@ -87,6 +84,11 @@ def main():
     ap = argparse.ArgumentParser(description="Parallel PII extraction over emails CSV")
     ap.add_argument("csv", help="Path to input CSV file")
     ap.add_argument(
+        "-m", "--model-dir",
+        required=True,
+        help="Path to ab-ai/pii_model snapshot (required)"
+    )
+    ap.add_argument(
         "-j", "--jobs",
         type=int,
         default=os.cpu_count(),
@@ -105,6 +107,12 @@ def main():
     )
     args = ap.parse_args()
 
+    # Export model path for email_processing and validate
+    model_dir_resolved = os.path.expanduser(args.model_dir)
+    if not os.path.exists(model_dir_resolved):
+        sys.exit(f"ERROR: model directory {model_dir_resolved} does not exist.")
+    os.environ["PII_MODEL_DIR"] = model_dir_resolved
+
     # install interrupt handler
     _install_sigint_handler()
 
@@ -113,6 +121,10 @@ def main():
         os.environ["PII_FORCE_CPU"] = "1"
     elif args.device == "cuda":
         os.environ["PII_FORCE_CPU"] = "0"
+
+    # ── defer these imports until env-vars are ready ───────────────────
+    from email_processing import preload_pipe
+    from chunk_worker import process_rows
 
     # Warm up the model in parent (helps with fork sharing)
     preload_pipe()
