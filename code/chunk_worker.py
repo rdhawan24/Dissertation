@@ -1,64 +1,112 @@
+# chunk_worker.py
 """
-chunk_worker.py – worker process code.
+Process a CSV slice in a separate process.
 
-Each worker:
-1. Reads *n_rows* rows starting at *start_row* from the CSV.
-2. Extracts plain-text e-mail bodies (fast).
-3. Runs batched PII NER, emitting progress to *progress_q* every batch.
-4. Returns a Polars DataFrame with the original path plus 5 PII columns.
+Behaviour
+=========
+
+* NO -e / --encrypt  →  fast-path
+      · No model/NER/FPE work at all
+      · Returns:  file, message   (raw body)
+
+* WITH -e / --encrypt →  full pipeline
+      · NER + Format-Preserving Encryption (FPE)
+      · Returns:  file, message (encrypted) + PII columns
 """
 
 from __future__ import annotations
 
+import os
+import traceback
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Dict, Tuple
 
 import polars as pl
 
-from email_processing import ner_batch, _extract_body, BATCH_SIZE
+_DO_ENCRYPT = os.getenv("PII_DO_ENCRYPT") == "1"
 
-BODY_LIMIT = 2_000   # trim huge messages
-
-
-def _stream_batches(bodies: List[str], progress_q, step: int) -> List[dict]:
-    """NER in *step*-sized chunks; stream progress after each chunk."""
-    out: List[dict] = []
-    for i in range(0, len(bodies), step):
-        batch = bodies[i : i + step]
-        out.extend(ner_batch(batch))
-        if progress_q is not None:
-            progress_q.put(len(batch))      # rows processed
-    return out
-
-
-def process_rows(
-    path: str | Path,
-    start_row: int,
-    n_rows: int,
-    progress_q: Optional[object] = None,    # manager.Queue proxy
-) -> pl.DataFrame:
-    """Worker entry point – must be pickle-able under the 'spawn' context."""
-    if n_rows <= 0:
-        return pl.DataFrame()
-
-    # 1. Load slice
-    df = pl.read_csv(
-        path,
-        has_header=True,
-        skip_rows=start_row,
-        n_rows=n_rows,
-        new_columns=["file", "message"],
-        infer_schema_length=0,
-        low_memory=True,
+# Import heavy e-mail-processing machinery only when needed
+if _DO_ENCRYPT:  # conditional import saves memory & start-up time
+    from email_processing import (
+        ner_batch,
+        encrypt_batch,
+        _extract_body,
+        BATCH_SIZE,
     )
 
-    # 2. Extract bodies
-    bodies: List[str] = [_extract_body(m, BODY_LIMIT) for m in df["message"]]
 
-    # 3. Batched NER with incremental progress
-    meta_dicts = _stream_batches(bodies, progress_q, step=BATCH_SIZE)
+# ─────────────────────────────────────────────────────────────────────────────
+def _stream_batches(
+    bodies: List[str], progress_q, step: int
+) -> Tuple[List[Dict[str, str]], List[str]]:
+    """
+    Mini-batch helper: runs NER + FPE (only called when _DO_ENCRYPT).
+    """
+    meta_out: List[Dict[str, str]] = []
+    body_out: List[str] = []
 
-    # 4. Merge & return
-    meta_df = pl.from_dicts(meta_dicts)
-    return pl.concat([df.select("file"), meta_df], how="horizontal")
+    for i in range(0, len(bodies), step):
+        batch = bodies[i : i + step]
 
+        meta_rows, enc_bodies = encrypt_batch(batch)
+        meta_out.extend(meta_rows)
+        body_out.extend(enc_bodies)
+
+        if progress_q is not None:
+            progress_q.put(len(batch))
+
+    return meta_out, body_out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+def process_rows(
+    path: str | Path,
+    start: int,
+    n: int,
+    progress_q,
+    partial_dir: str | None = None,     # NEW
+) -> pl.DataFrame:
+    """
+    Worker entry point called by ProcessPoolExecutor.
+
+    Fast-path (no –encrypt) skips all ML/FPE work.
+    If *partial_dir* is given, the slice is also written to
+    DIR/part_<start>_<end>.csv before returning.
+    """
+    path = Path(path)
+
+    # read slice; skip_rows accounts for header (+1)
+    df = pl.read_csv(
+        path,
+        has_header=False,
+        skip_rows=start + 1,
+        n_rows=n,
+    )
+    df.columns = ["file", "message"]
+
+    # ── FAST-PATH ───────────────────────────────────────────────────────
+    if not _DO_ENCRYPT:
+        out_df = df.select("file", "message")
+    else:
+        # ── ENCRYPTION PATH ────────────────────────────────────────────
+        bodies = [_extract_body(m) for m in df["message"]]
+        try:
+            meta_dicts, new_bodies = _stream_batches(bodies, progress_q, BATCH_SIZE)
+        except Exception:
+            traceback.print_exc()
+            return pl.DataFrame()  # fail-safe
+
+        out_df = (
+            df.with_columns(pl.Series("message", new_bodies))
+              .select("file", "message")
+              .hstack(pl.DataFrame(meta_dicts))
+        )
+
+    # ──  NEW  : write immediately for incremental visibility  ──────────
+    if partial_dir:
+        part_dir = Path(partial_dir)
+        part_dir.mkdir(parents=True, exist_ok=True)
+        part_file = part_dir / f"part_{start:09d}_{start+n-1:09d}.csv"
+        out_df.write_csv(part_file, include_header=not part_file.exists())
+    return out_df
+    
