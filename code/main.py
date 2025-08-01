@@ -109,6 +109,17 @@ def main():
                     action="store_true",
                     help="Extract entities *and* rewrite the e-mail bodies "
                          "using format-preserving encryption")
+    ap.add_argument(
+        "--partial-dir",
+        help="If set, each processed slice is immediately written to this "
+             "directory as part_<firstrow>_<lastrow>.csv for live inspection.",
+    )
+    ap.add_argument(
+        "--slice-rows",
+        type=int,
+        help="Override automatic slice sizing; useful together with --partial-dir "
+             "to get smaller, more frequent chunks.",
+    )
     args = ap.parse_args()
 
     # Export model path for email_processing and validate
@@ -139,7 +150,12 @@ def main():
     total_all = count_rows(args.csv)
     total = min(total_all, args.num_rows) if args.num_rows else total_all
 
-    slice_size = pick_slice_rows(total, args.jobs)
+    # determine slice size
+    slice_size = (
+        args.slice_rows
+        if args.slice_rows                 # honour manual override
+        else pick_slice_rows(total, args.jobs)
+    )
     slices = plan_slices(total, slice_size)
 
     manager = Manager()
@@ -153,7 +169,7 @@ def main():
     pool = ProcessPoolExecutor(max_workers=workers, mp_context=ctx)
     try:
         futures = [
-            pool.submit(process_rows, args.csv, start, count, prog_q)
+            pool.submit(process_rows, args.csv, start, count, prog_q, args.partial_dir)
             for start, count in slices
         ]
         pbar = tqdm(total=total, desc="Processing rows", unit="rows")

@@ -64,11 +64,14 @@ def process_rows(
     start: int,
     n: int,
     progress_q,
+    partial_dir: str | None = None,     # NEW
 ) -> pl.DataFrame:
     """
     Worker entry point called by ProcessPoolExecutor.
 
     Fast-path (no –encrypt) skips all ML/FPE work.
+    If *partial_dir* is given, the slice is also written to
+    DIR/part_<start>_<end>.csv before returning.
     """
     path = Path(path)
 
@@ -81,21 +84,29 @@ def process_rows(
     )
     df.columns = ["file", "message"]
 
-    # ── FAST-PATH ────────────────────────────────────────────────────────
+    # ── FAST-PATH ───────────────────────────────────────────────────────
     if not _DO_ENCRYPT:
-        return df.select("file", "message")
+        out_df = df.select("file", "message")
+    else:
+        # ── ENCRYPTION PATH ────────────────────────────────────────────
+        bodies = [_extract_body(m) for m in df["message"]]
+        try:
+            meta_dicts, new_bodies = _stream_batches(bodies, progress_q, BATCH_SIZE)
+        except Exception:
+            traceback.print_exc()
+            return pl.DataFrame()  # fail-safe
 
-    # ── ENCRYPTION PATH ─────────────────────────────────────────────────
-    bodies = [_extract_body(m) for m in df["message"]]
+        out_df = (
+            df.with_columns(pl.Series("message", new_bodies))
+              .select("file", "message")
+              .hstack(pl.DataFrame(meta_dicts))
+        )
 
-    try:
-        meta_dicts, new_bodies = _stream_batches(bodies, progress_q, BATCH_SIZE)
-    except Exception:
-        traceback.print_exc()
-        return pl.DataFrame()  # fail-safe
+    # ──  NEW  : write immediately for incremental visibility  ──────────
+    if partial_dir:
+        part_dir = Path(partial_dir)
+        part_dir.mkdir(parents=True, exist_ok=True)
+        part_file = part_dir / f"part_{start:09d}_{start+n-1:09d}.csv"
+        out_df.write_csv(part_file, include_header=not part_file.exists())
 
-    df = df.with_columns(pl.Series("message", new_bodies))
-    left = df.select("file", "message")
-    meta_df = pl.DataFrame(meta_dicts)
-
-    return pl.concat([left, meta_df], how="horizontal")
+    return out_df

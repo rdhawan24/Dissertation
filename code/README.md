@@ -67,4 +67,5 @@ The current active token is: `FPE`
 
 
 
-time python3 ./code/main.py ./dataset/emails.csv -j 4
+time python3 ./code/main.py ./dataset/emails.csv -m ./hf_models/pii_model/ab-ai/ -n 500 -j 4 -e --partial-dir ./tmp/enron_parts --slice-rows 10
+
