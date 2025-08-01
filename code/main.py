@@ -105,6 +105,10 @@ def main():
         default=None,
         help="Override device choice (auto = GPU if available)",
     )
+    ap.add_argument("-e", "--encrypt",
+                    action="store_true",
+                    help="Extract entities *and* rewrite the e-mail bodies "
+                         "using format-preserving encryption")
     args = ap.parse_args()
 
     # Export model path for email_processing and validate
@@ -112,6 +116,9 @@ def main():
     if not os.path.exists(model_dir_resolved):
         sys.exit(f"ERROR: model directory {model_dir_resolved} does not exist.")
     os.environ["PII_MODEL_DIR"] = model_dir_resolved
+
+    if args.encrypt:
+        os.environ["PII_DO_ENCRYPT"] = "1"
 
     # install interrupt handler
     _install_sigint_handler()
@@ -126,8 +133,8 @@ def main():
     from email_processing import preload_pipe
     from chunk_worker import process_rows
 
-    # Warm up the model in parent (helps with fork sharing)
-    preload_pipe()
+    if args.encrypt:
+        preload_pipe()
 
     total_all = count_rows(args.csv)
     total = min(total_all, args.num_rows) if args.num_rows else total_all

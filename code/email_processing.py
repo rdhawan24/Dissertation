@@ -1,8 +1,8 @@
-# code/email_processing.py
+# email_processing.py
 """
-Strict local PII extractor for ab-ai/pii_model.
-Loads model ONLY from the directory given in the env-var PII_MODEL_DIR.
-If that env-var is unset or the directory is incomplete → hard error.
+Strict local PII extractor + Format-Preserving Encryption helpers.
+
+Only loaded when PII_DO_ENCRYPT=1, so normal runs incur zero model cost.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List
 
+import pyffx                      # pip install pyffx
 import torch
 from transformers import (
     AutoModelForTokenClassification,
@@ -24,41 +25,41 @@ from transformers import (
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# ── Resolve and validate model dir ───────────────────────────────────────
+# ── Model snapshot dir ──────────────────────────────────────────────────────
 try:
     MODEL_DIR = Path(os.environ["PII_MODEL_DIR"]).expanduser().resolve()
 except KeyError:
-    sys.exit("ERROR: PII_MODEL_DIR not set. Use -m/--model-dir or export PII_MODEL_DIR.")
+    sys.exit("ERROR: PII_MODEL_DIR not set (use -m/--model-dir).")
 
-required_file = MODEL_DIR / "config.json"
-if not required_file.exists():
-    sys.exit(f"ERROR: {MODEL_DIR} does not look like a valid snapshot "
-             "(missing config.json).")
+if not (MODEL_DIR / "config.json").exists():
+    sys.exit(f"ERROR: {MODEL_DIR} is not a valid model snapshot (missing config.json).")
 
-# ── Config knobs ─────────────────────────────────────────────────────────
-BATCH_SIZE    = int(os.getenv("PII_BATCH_SIZE", "32"))
+# ── Config knobs ────────────────────────────────────────────────────────────
+BATCH_SIZE = int(os.getenv("PII_BATCH_SIZE", "32"))
+DEVICE = 0 if torch.cuda.is_available() and not os.getenv("PII_FORCE_CPU") else -1
 TORCH_THREADS = 1
-FORCE_CPU     = os.getenv("PII_FORCE_CPU", "0") == "1"
-DEVICE        = 0 if torch.cuda.is_available() and not FORCE_CPU else -1
 
 LABEL_MAP: Dict[str, str] = {
-    "PER_FIRST":   "first_names",
-    "PER_LAST":    "last_names",
-    "CURRENCY":    "currencies",
+    "PER_FIRST": "first_names",
+    "PER_LAST": "last_names",
+    "CURRENCY": "currencies",
     "CREDIT_CARD": "credit_cards",
-    "CC_ISSUER":   "cc_issuers",
+    "CC_ISSUER": "cc_issuers",
 }
 _EMPTY_ROW = {col: "" for col in LABEL_MAP.values()}
 
-_PIPE = None  # singleton
+_PIPE = None
+
+# ── FPE constants ───────────────────────────────────────────────────────────
+_FPE_KEY = os.getenv("FPE_KEY", "mysupersecretkey").encode()
+_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ .'-"
 
 
+# ── Pipeline loader ─────────────────────────────────────────────────────────
 def _get_pipe():
     global _PIPE
     if _PIPE is not None:
         return _PIPE
-
-    warnings.filterwarnings("ignore", category=FutureWarning)
 
     tok = AutoTokenizer.from_pretrained(MODEL_DIR)
     mdl = AutoModelForTokenClassification.from_pretrained(MODEL_DIR)
@@ -75,10 +76,9 @@ def _get_pipe():
     return _PIPE
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────────────────────
 @lru_cache(maxsize=4096)
 def _extract_body(raw: str) -> str:
-    """Strip headers, cut at signature marker, remove rudimentary HTML."""
     parts = raw.split("\n\n", 1)
     body = parts[1] if len(parts) > 1 else raw
     body = body.split("\n-- \n", 1)[0]
@@ -100,13 +100,60 @@ def ner_batch(bodies: List[str]):
                 buckets[col].add(ent["word"].strip())
         rows.append({c: "|".join(sorted(v)) for c, v in buckets.items()})
 
-    # pad if len mismatch (rare but safe)
     while len(rows) < len(bodies):
         rows.append(_EMPTY_ROW.copy())
 
     return rows
 
 
+# ── FPE primitives ──────────────────────────────────────────────────────────
+def _enc_name(token: str) -> str:
+    cipher = pyffx.String(_FPE_KEY, alphabet=_ALPHABET, length=len(token))
+    return cipher.encrypt(token)
+
+
+def _enc_int_str(num: str) -> str:
+    cipher = pyffx.Integer(_FPE_KEY, length=len(num))
+    return str(cipher.encrypt(int(num))).zfill(len(num))
+
+
+def encrypt_money(expr: str) -> str:
+    return re.sub(r"\d+", lambda m: _enc_int_str(m.group()), expr)
+
+
+def encrypt_card(card: str) -> str:
+    digits = re.sub(r"\D", "", card)
+    enc = _enc_int_str(digits)
+    return " ".join(enc[i : i + 4] for i in range(0, len(enc), 4))
+
+
+# ── Batch variant (NER + FPE) ───────────────────────────────────────────────
+def encrypt_batch(bodies: List[str]):
+    meta_rows = ner_batch(bodies)
+    enc_bodies: List[str] = []
+
+    for raw_body, meta in zip(bodies, meta_rows):
+        text = raw_body
+
+        # names
+        for bucket in ("first_names", "last_names"):
+            for name in filter(None, meta[bucket].split("|")):
+                text = re.sub(rf"\b{re.escape(name)}\b", _enc_name(name), text)
+
+        # card numbers
+        for cc in filter(None, meta["credit_cards"].split("|")):
+            digits = re.sub(r"\D", "", cc)
+            text = text.replace(digits, encrypt_card(digits))
+
+        # money amounts like "$12,345.67"
+        for expr in re.findall(r"[$€£]\s?\d[\d,.,]*", text):
+            text = text.replace(expr, encrypt_money(expr))
+
+        enc_bodies.append(text)
+
+    return meta_rows, enc_bodies
+
+
 def preload_pipe():
-    """Load model once in parent so forkserver children share memory."""
+    """Optionally called by parent so workers share model memory."""
     _get_pipe()
