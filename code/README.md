@@ -75,6 +75,10 @@ pip3 install "names-dataset>=3"
 python build_namesets.py
 
 
+export PII_FIRSTNAME_FILE=datasets/firstnames.txt
+
+export PII_SURNAME_FILE=datasets/surnames.txt
+
 
 time python3 ./code/main.py ./dataset/emails.csv -m ./hf_models/pii_model/ab-ai/ -n 500 -j 4 -e --partial-dir ./tmp/enron_parts --slice-rows 10
 
