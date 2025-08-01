@@ -66,6 +66,15 @@ The current active token is: `FPE`
 (enron) mohan@Garfield:~/Software/Personal/Dissertation/hf_models/pii_model$ huggingface-cli download ab-ai/pii_model --local-dir ./hf_models/pii_model/ab-ai/ --local-dir-use-symlinks False
 
 
+To build first/second name sets
+
+
+pip3 install "names-dataset>=3"
+
+
+python build_namesets.py
+
+
 
 time python3 ./code/main.py ./dataset/emails.csv -m ./hf_models/pii_model/ab-ai/ -n 500 -j 4 -e --partial-dir ./tmp/enron_parts --slice-rows 10
 
