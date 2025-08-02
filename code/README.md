@@ -24,6 +24,8 @@ print("CPU:", platform.processor())
 PY
 ```
 
+incase of numpy error pip install numpy==1.26.4
+
 
 ```
 torch 2.3.1+cpu | CUDA: False
