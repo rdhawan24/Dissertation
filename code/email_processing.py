@@ -49,6 +49,32 @@ LABEL_MAP: Dict[str, str] = {
     "CURRENCYCODE": "currencies",
 }
 
+# ── Regex patterns for card and money ───────────────────────────────────────
+CARD_PATTERNS = [
+    # Visa: 13 or 16 digits, starts with 4
+    r'\b4[0-9]{12}(?:[0-9]{3})?\b',
+    # MasterCard: 16 digits, starts with 51–55
+    r'\b5[1-5][0-9]{14}\b',
+    # Amex: 15 digits, starts with 34 or 37
+    r'\b3[47][0-9]{13}\b',
+    # Discover: starts with 6011 or 65
+    r'\b6(?:011|5[0-9]{2})[0-9]{12}\b',
+    # Allow for separators (spaces or hyphens)
+    r'\b(?:4[0-9]{3}[- ]?[0-9]{4}[- ]?[0-9]{4}[- ]?[0-9]{4})\b',  # Visa
+    r'\b(?:5[1-5][0-9]{2}[- ]?[0-9]{4}[- ]?[0-9]{4}[- ]?[0-9]{4})\b',  # MC
+    r'\b(?:3[47][0-9]{2}[- ]?[0-9]{6}[- ]?[0-9]{5})\b',  # Amex
+    r'\b(?:6(?:011|5[0-9]{2})[- ]?[0-9]{4}[- ]?[0-9]{4}[- ]?[0-9]{4})\b',  # Discover
+]
+
+MONEY_PATTERNS = [
+    # $6.47   £1,234.00   $    4,024   ($728,921)   €500
+    r"[$€£]\s*\d[\d\s,]*(?:\.\d+)?",
+    # USD 1000.00  – code before number
+    r"\b(?:USD|GBP|EUR)\s*\d[\d\s,]*(?:\.\d+)?",
+    # 1000 USD     – code after number
+    r"\b\d[\d\s,]*(?:\.\d+)?\s*(?:USD|GBP|EUR)\b",
+]
+
 _EMPTY_ROW = {col: "" for col in LABEL_MAP.values()}
 
 _PIPE = None
@@ -89,9 +115,9 @@ def _extract_body(raw: str) -> str:
     return body.strip()
 
 
-# Assuming LABEL_MAP, _EMPTY_ROW, and _get_pipe() are already defined elsewhere
+# Assuming LABEL_MAP, _EMPTY_ROW, and _get_pipe() are already defined 
 
-# Utility functions from your snippet
+# Utility functions 
 def fix_apostrophes(entities):
     for ent in entities:
         ent["word"] = re.sub(r"\s*'\s*", "'", ent["word"])
@@ -104,6 +130,20 @@ def firstname_validate(name: str) -> bool:
 def lastname_validate(name: str) -> bool:
     clean = re.sub(r"[.,;:!?]+$", "", name)
     return bool(re.fullmatch(r"^[A-Za-z]+(?:['-][A-Za-z]+)*$", clean))
+
+def find_card_and_money_entities(text: str) -> List[Tuple[str, str]]:
+    """
+    Returns a list of (entity_type, matched_text) using regex.
+    """
+    matches = []
+    for pattern in CARD_PATTERNS:
+        for m in re.findall(pattern, text):
+            matches.append(("CREDIT_CARD", m))
+    for pattern in MONEY_PATTERNS:
+        for m in re.findall(pattern, text):
+            matches.append(("MONEY", m))
+    return matches
+
 
 def ner_batch(bodies: List[str]):
     pipe = _get_pipe()
@@ -239,6 +279,45 @@ def encrypt_card(card: str) -> str:
 
 # ── Batch variant (NER + FPE) ───────────────────────────────────────────────
 def encrypt_batch(bodies: List[str]):
+    """
+    bodies  : list of raw e-mail strings
+    returns : (meta_rows, enc_bodies)
+              meta_rows  – output of ner_batch()  (names etc.)
+              enc_bodies – same e-mails with names, cards & money FPE-encrypted
+    """
+    meta_rows = ner_batch(bodies)      # still use HF model for names
+    enc_bodies: List[str] = []
+
+    for raw_body, meta in zip(bodies, meta_rows):
+        text = raw_body
+
+        # 1) Encrypt first & last names detected by HuggingFace model
+        for bucket, validator in [
+            ("first_names", firstname_validate),
+            ("last_names",  lastname_validate),
+        ]:
+            for name in filter(None, meta[bucket].split("|")):
+                clean = re.sub(r"[.,;:!?]+$", "", name)
+                if validator(clean) and all(c in _ALPHABET for c in clean):
+                    enc = _enc_name(clean)
+
+                    # replace only the core alphabetical part (case-insensitive)
+                    core = re.sub(r"^[^A-Za-z]+|[^A-Za-z]+$", "", name)
+                    text = re.sub(rf"\b{re.escape(core)}\b", enc,
+                                  text, flags=re.IGNORECASE)
+
+        # 2) Detect credit-card numbers & money expressions with regex
+        for entity_type, match in find_card_and_money_entities(text):
+            if entity_type == "CREDIT_CARD":
+                text = text.replace(match, encrypt_card(match))
+            elif entity_type == "MONEY":
+                text = text.replace(match, encrypt_money(match))
+
+        enc_bodies.append(text)
+
+    return meta_rows, enc_bodies
+
+"""def encrypt_batch(bodies: List[str]):
     meta_rows = ner_batch(bodies)
     enc_bodies: List[str] = []
 
@@ -269,7 +348,7 @@ def encrypt_batch(bodies: List[str]):
 
         enc_bodies.append(text)
 
-    return meta_rows, enc_bodies
+    return meta_rows, enc_bodies"""
 
 
 
