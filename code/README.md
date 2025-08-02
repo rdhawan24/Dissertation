@@ -99,3 +99,7 @@ $ pip install "gliner[gpu]"             # pulls both ORT wheels…
 $ pip uninstall -y onnxruntime
 
 $ pip install --force-reinstall onnxruntime-gpu
+
+
+
+time python3 ./code/main.py ~/Desktop/input.csv -m ./hf_models/pii_model/gliner_multi_pii_onnx -j 1 -e --partial-dir ./tmp/ --slice-rows 1
