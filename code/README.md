@@ -82,3 +82,20 @@ export PII_SURNAME_FILE=datasets/surnames.txt
 
 time python3 ./code/main.py ./dataset/emails.csv -m ./hf_models/pii_model/ab-ai/ -n 500 -j 4 -e --partial-dir ./tmp/enron_parts --slice-rows 10
 
+
+
+
+huggingface-cli download onnx-community/gliner_multi_pii-v1 --local-dir ./hf_models/pii_model/gliner_multi_pii_onnx --local-dir-use-symlinks False
+
+
+$ pip install gliner onnxruntime        # ~130 MB download
+
+
+
+$ pip install "gliner[gpu]"             # pulls both ORT wheels…
+
+# …then drop the CPU wheel so the GPU backend is picked up
+
+$ pip uninstall -y onnxruntime
+
+$ pip install --force-reinstall onnxruntime-gpu
