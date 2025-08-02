@@ -101,5 +101,12 @@ $ pip uninstall -y onnxruntime
 $ pip install --force-reinstall onnxruntime-gpu
 
 
+# must have these exports
+
+$ export PII_FIRSTNAME_FILE=./code/names_datasets/firstnames.txt 
+
+
+$ export PII_SURNAME_FILE=./code/names_datasets/surnames.txt
+
 
 time python3 ./code/main.py ~/Desktop/input.csv -m ./hf_models/pii_model/gliner_multi_pii_onnx -j 1 -e --partial-dir ./tmp/ --slice-rows 1

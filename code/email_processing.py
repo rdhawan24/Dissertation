@@ -88,10 +88,8 @@ def _load_set(path: str) -> Set[str]:
     except FileNotFoundError:
         return set()
 
-FIRSTNAME_SET = _load_set(os.getenv("PII_FIRSTNAME_FILE", "")) or {
-    "john", "mary", "michael", "linda", "james", "robert", "patricia", "peter"}
-SURNAME_SET = _load_set(os.getenv("PII_SURNAME_FILE", "")) or {
-    "smith", "jones", "brown", "williams", "johnson", "patel", "lee", "singh"}
+FIRSTNAME_SET = _load_set(os.getenv("PII_FIRSTNAME_FILE", ""))
+SURNAME_SET = _load_set(os.getenv("PII_SURNAME_FILE", ""))
 
 ISO_CURRENCY_CODES = {
     "USD","EUR","INR","GBP","JPY","CNY","AUD","CAD","CHF","SGD","SEK",
@@ -178,7 +176,6 @@ def _build_gliner_pipe():
             rows = []
             for txt in texts:
                 ents = model.predict_entities(txt, labels, threshold=th)
-                print(ents)
                 rows.append([
                     {
                         "entity_group": e["label"].upper(),
@@ -335,7 +332,7 @@ def _ln_ok(name: str) -> bool: return NAME_RE.fullmatch(name) and name.lower() i
 def ner_batch(bodies: List[str]):
     pipe = _get_pipe()
     ents_rows = pipe(bodies)
-    print(ents_rows)
+    # print("Raw:", ents_rows)
     rows: List[Dict[str, str]] = []
     for ents, body in zip(ents_rows, bodies):
         buckets: Dict[str, set] = {c: set() for c in LABEL_MAP.values()}
@@ -380,7 +377,6 @@ def ner_batch(bodies: List[str]):
 
             col = LABEL_MAP.get(grp)
             if col:
-                print(col, word)
                 buckets[col].add(word)
                 if col == "credit_cards":
                     buckets["cc_issuers"].add(get_credit_card_issuer(word))
